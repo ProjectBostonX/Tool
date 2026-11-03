@@ -1,0 +1,203 @@
+name: Project X Boston Recovery Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      RECOVERY_TYPE:
+        description: "Recovery flavor (Boston tree currently configured for TWRP)"
+        required: true
+        default: "twrp"
+        type: choice
+        options:
+          - twrp
+      MANIFEST_URL:
+        description: "Manifest URL"
+        required: true
+        default: "https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git"
+        type: string
+      MANIFEST_BRANCH:
+        description: "Manifest branch"
+        required: true
+        default: "twrp-12.1"
+        type: string
+      DEVICE_TREE_URL:
+        description: "Boston device tree URL"
+        required: true
+        default: "https://github.com/PizzaG/android_device_motorola_boston.git"
+        type: string
+      DEVICE_TREE_BRANCH:
+        description: "Boston device tree branch"
+        required: true
+        default: "TWRP"
+        type: string
+      DEVICE_PATH:
+        description: "Device tree destination"
+        required: true
+        default: "device/motorola/boston"
+        type: string
+      COMMON_TREE_URL:
+        description: "Optional common tree Git URL"
+        required: false
+        default: ""
+        type: string
+      COMMON_TREE_BRANCH:
+        description: "Optional common tree branch"
+        required: false
+        default: ""
+        type: string
+      COMMON_PATH:
+        description: "Optional common tree destination"
+        required: false
+        default: ""
+        type: string
+      DEVICE_NAME:
+        description: "Output product directory"
+        required: true
+        default: "boston"
+        type: string
+      MAKEFILE_NAME:
+        description: "Lunch product name"
+        required: true
+        default: "twrp_boston"
+        type: string
+      BUILD_TARGET:
+        description: "Build target (without image suffix)"
+        required: true
+        default: "recovery"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      RECOVERY_TYPE: ${{ inputs.RECOVERY_TYPE }}
+      MANIFEST_URL: ${{ inputs.MANIFEST_URL }}
+      MANIFEST_BRANCH: ${{ inputs.MANIFEST_BRANCH }}
+      DEVICE_TREE_URL: ${{ inputs.DEVICE_TREE_URL }}
+      DEVICE_TREE_BRANCH: ${{ inputs.DEVICE_TREE_BRANCH }}
+      DEVICE_PATH: ${{ inputs.DEVICE_PATH }}
+      COMMON_TREE_URL: ${{ inputs.COMMON_TREE_URL }}
+      COMMON_TREE_BRANCH: ${{ inputs.COMMON_TREE_BRANCH }}
+      COMMON_PATH: ${{ inputs.COMMON_PATH }}
+      DEVICE_NAME: ${{ inputs.DEVICE_NAME }}
+      MAKEFILE_NAME: ${{ inputs.MAKEFILE_NAME }}
+      BUILD_TARGET: ${{ inputs.BUILD_TARGET }}
+
+    steps:
+      - name: Check out builder
+        uses: actions/checkout@v4
+
+      - name: Print build configuration
+        run: |
+          echo "Project X Boston Recovery Builder"
+          echo "Device: ${DEVICE_NAME}"
+          echo "Recovery: ${RECOVERY_TYPE}"
+          echo "Manifest branch: ${MANIFEST_BRANCH}"
+          echo "Device tree branch: ${DEVICE_TREE_BRANCH}"
+          echo "Product: ${MAKEFILE_NAME}"
+          echo "Target: ${BUILD_TARGET}"
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
+            lib32z1-dev liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush python3 rsync schedtool \
+            squashfs-tools unzip wget zip zlib1g-dev
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install repo tool
+        run: |
+          mkdir -p "${HOME}/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "${HOME}/bin/repo"
+          chmod +x "${HOME}/bin/repo"
+          echo "${HOME}/bin" >> "${GITHUB_PATH}"
+
+      - name: Validate build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RECOVERY_TYPE}" == "twrp" ]] || { echo "Only TWRP is currently configured for Boston."; exit 1; }
+          [[ "${DEVICE_PATH}" == device/* ]] || { echo "DEVICE_PATH must be inside device/."; exit 1; }
+          [[ "${DEVICE_NAME}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid DEVICE_NAME."; exit 1; }
+          [[ "${MAKEFILE_NAME}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid MAKEFILE_NAME."; exit 1; }
+          [[ "${BUILD_TARGET}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid BUILD_TARGET."; exit 1; }
+          [[ "${MANIFEST_URL}" == https://github.com/* || "${MANIFEST_URL}" == https://gitlab.com/* ]] || { echo "Use a supported HTTPS manifest URL."; exit 1; }
+          [[ "${DEVICE_TREE_URL}" == https://github.com/* || "${DEVICE_TREE_URL}" == https://gitlab.com/* ]] || { echo "Use a supported HTTPS device-tree URL."; exit 1; }
+
+      - name: Initialize Android source
+        run: |
+          set -euo pipefail
+          mkdir -p workspace
+          cd workspace
+          git config --global user.name "Project X Boston Builder"
+          git config --global user.email "project-x-boston-builder@users.noreply.github.com"
+          repo init --depth=1 -u "${MANIFEST_URL}" -b "${MANIFEST_BRANCH}"
+
+      - name: Sync Android source
+        run: |
+          set -euo pipefail
+          cd workspace
+          repo sync -c --no-clone-bundle --no-tags -j"$(nproc --all)" --force-sync
+
+      - name: Add Boston device tree
+        run: |
+          set -euo pipefail
+          cd workspace
+          mkdir -p "$(dirname "${DEVICE_PATH}")"
+          git clone --depth=1 --branch "${DEVICE_TREE_BRANCH}" "${DEVICE_TREE_URL}" "${DEVICE_PATH}"
+
+      - name: Add optional common tree
+        if: ${{ inputs.COMMON_TREE_URL != '' && inputs.COMMON_PATH != '' }}
+        run: |
+          set -euo pipefail
+          cd workspace
+          mkdir -p "$(dirname "${COMMON_PATH}")"
+          if [[ -n "${COMMON_TREE_BRANCH}" ]]; then
+            git clone --depth=1 --branch "${COMMON_TREE_BRANCH}" "${COMMON_TREE_URL}" "${COMMON_PATH}"
+          else
+            git clone --depth=1 "${COMMON_TREE_URL}" "${COMMON_PATH}"
+          fi
+
+      - name: Build recovery image
+        run: |
+          set -euo pipefail
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          cd workspace
+          source build/envsetup.sh
+          lunch "${MAKEFILE_NAME}-eng"
+          mka "${BUILD_TARGET}image" -j"$(nproc --all)"
+          test -s "out/target/product/${DEVICE_NAME}/${BUILD_TARGET}.img"
+
+      - name: Upload recovery image
+        uses: actions/upload-artifact@v4
+        with:
+          name: boston-${{ inputs.RECOVERY_TYPE }}-recovery
+          path: |
+            workspace/out/target/product/${{ inputs.DEVICE_NAME }}/${{ inputs.BUILD_TARGET }}.img
+            workspace/out/target/product/${{ inputs.DEVICE_NAME }}/boot.img
+          if-no-files-found: error
+          retention-days: 14

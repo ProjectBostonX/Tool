@@ -1,0 +1,215 @@
+name: Boston OmniROM Recovery Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_URL:
+        description: "OmniROM/recovery manifest HTTPS Git URL"
+        required: true
+        default: ""
+        type: string
+      MANIFEST_BRANCH:
+        description: "Manifest branch"
+        required: true
+        default: ""
+        type: string
+      DEVICE_TREE_URL:
+        description: "Boston device-tree HTTPS Git URL"
+        required: true
+        default: "https://github.com/PizzaG/android_device_motorola_boston.git"
+        type: string
+      DEVICE_TREE_BRANCH:
+        description: "Boston device-tree branch"
+        required: true
+        default: "TWRP"
+        type: string
+      DEVICE_PATH:
+        description: "Device-tree path in source checkout"
+        required: true
+        default: "device/motorola/boston"
+        type: string
+      PRODUCT:
+        description: "Lunch product name (must have a matching .mk file)"
+        required: true
+        default: "omni_boston"
+        type: string
+      DEVICE_NAME:
+        description: "Output product directory"
+        required: true
+        default: "boston"
+        type: string
+      BUILD_TARGET:
+        description: "Recovery target"
+        required: true
+        default: "recovery"
+        type: string
+      COMMON_TREE_URL:
+        description: "Optional common-tree HTTPS Git URL"
+        required: false
+        default: ""
+        type: string
+      COMMON_TREE_BRANCH:
+        description: "Optional common-tree branch"
+        required: false
+        default: ""
+        type: string
+      COMMON_PATH:
+        description: "Optional common-tree path"
+        required: false
+        default: "device/motorola/sm6450-common"
+        type: string
+      BUILD_JOBS:
+        description: "Parallel build jobs"
+        required: true
+        type: choice
+        options:
+          - "2"
+          - "4"
+        default: "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boston-omni-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      MANIFEST_URL: ${{ inputs.MANIFEST_URL }}
+      MANIFEST_BRANCH: ${{ inputs.MANIFEST_BRANCH }}
+      DEVICE_TREE_URL: ${{ inputs.DEVICE_TREE_URL }}
+      DEVICE_TREE_BRANCH: ${{ inputs.DEVICE_TREE_BRANCH }}
+      DEVICE_PATH: ${{ inputs.DEVICE_PATH }}
+      PRODUCT: ${{ inputs.PRODUCT }}
+      DEVICE_NAME: ${{ inputs.DEVICE_NAME }}
+      BUILD_TARGET: ${{ inputs.BUILD_TARGET }}
+      COMMON_TREE_URL: ${{ inputs.COMMON_TREE_URL }}
+      COMMON_TREE_BRANCH: ${{ inputs.COMMON_TREE_BRANCH }}
+      COMMON_PATH: ${{ inputs.COMMON_PATH }}
+      BUILD_JOBS: ${{ inputs.BUILD_JOBS }}
+
+    steps:
+      - name: Check out workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \\
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \\
+            git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \\
+            lib32z1-dev liblz4-tool libncurses-dev libssl-dev libxml2-utils \\
+            lzop pngcrush python3 rsync schedtool squashfs-tools unzip wget zip zlib1g-dev
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install repo
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -eo pipefail
+          for v in "$MANIFEST_URL" "$MANIFEST_BRANCH" "$DEVICE_TREE_URL" "$DEVICE_TREE_BRANCH" "$DEVICE_PATH" "$PRODUCT" "$DEVICE_NAME" "$BUILD_TARGET"; do
+            if [[ -z "$v" ]]; then
+              echo "::error::A required build input is blank."
+              exit 1
+            fi
+          done
+          [[ "$DEVICE_PATH" == device/* ]] || { echo "::error::DEVICE_PATH must start with device/"; exit 1; }
+          [[ "$PRODUCT" =~ ^[A-Za-z0-9_-]+$ && "$DEVICE_NAME" =~ ^[A-Za-z0-9_-]+$ && "$BUILD_TARGET" =~ ^[A-Za-z0-9_-]+$ ]] || {
+            echo "::error::Invalid product, device or target name."
+            exit 1
+          }
+          [[ "$MANIFEST_URL" == https://* && "$DEVICE_TREE_URL" == https://* ]] || {
+            echo "::error::Use HTTPS Git URLs."
+            exit 1
+          }
+          if [[ -n "$COMMON_TREE_URL" && -z "$COMMON_PATH" ]]; then
+            echo "::error::COMMON_PATH is required when COMMON_TREE_URL is supplied."
+            exit 1
+          fi
+
+      - name: Initialize manifest
+        run: |
+          mkdir -p workspace
+          cd workspace
+          repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
+
+      - name: Sync source
+        working-directory: workspace
+        run: |
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j4
+
+      - name: Clone Boston device tree
+        working-directory: workspace
+        run: |
+          mkdir -p "$(dirname "$DEVICE_PATH")"
+          git clone --depth=1 --single-branch --branch "$DEVICE_TREE_BRANCH" "$DEVICE_TREE_URL" "$DEVICE_PATH"
+
+      - name: Clone optional common tree
+        if: ${{ inputs.COMMON_TREE_URL != '' }}
+        working-directory: workspace
+        run: |
+          mkdir -p "$(dirname "$COMMON_PATH")"
+          if [[ -n "$COMMON_TREE_BRANCH" ]]; then
+            git clone --depth=1 --single-branch --branch "$COMMON_TREE_BRANCH" "$COMMON_TREE_URL" "$COMMON_PATH"
+          else
+            git clone --depth=1 "$COMMON_TREE_URL" "$COMMON_PATH"
+          fi
+
+      - name: Validate device product
+        working-directory: workspace
+        shell: bash
+        run: |
+          set -eo pipefail
+          test -f build/envsetup.sh || { echo "::error::Manifest did not provide build/envsetup.sh"; exit 1; }
+          test -f "$DEVICE_PATH/BoardConfig.mk" || { echo "::error::Boston BoardConfig.mk was not found"; exit 1; }
+          test -f "$DEVICE_PATH/${PRODUCT}.mk" || {
+            echo "::error::${PRODUCT}.mk is missing from $DEVICE_PATH."
+            echo "The lunch product must match a product makefile in the device tree."
+            echo "For example, twrp_boston requires twrp_boston.mk; omni_boston requires omni_boston.mk."
+            exit 1
+          }
+          echo "Validated product: ${PRODUCT}"
+
+      - name: Set swap space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 12
+
+      - name: Build recovery
+        working-directory: workspace
+        shell: bash
+        run: |
+          # Do not use `set -u` before sourcing Android envsetup.sh.
+          set -eo pipefail
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          source build/envsetup.sh
+          lunch "${PRODUCT}-eng"
+          mka "${BUILD_TARGET}image" -j"${BUILD_JOBS}" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          test -s "out/target/product/${DEVICE_NAME}/${BUILD_TARGET}.img"
+
+      - name: Upload recovery image and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Boston-Omni-Recovery-${{ github.run_number }}
+          path: |
+            workspace/out/target/product/boston/recovery.img
+            build.log
+          if-no-files-found: warn
+          retention-days: 14
